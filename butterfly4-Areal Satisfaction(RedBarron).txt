@@ -1,0 +1,166 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation
+from scipy.special import ellipk, ellipe
+
+# ========= Константи =========
+mu0 = 4e-7*np.pi
+frequency = 2.0e5              # 200 kHz  (|E| = ω|Aφ|)
+omega = 2*np.pi*frequency
+sigma = 0.5                    # S/m (пример за тъкан)
+z_depth = 0.02                 # m – наблюдателна равнина в тъканта
+
+# ========= Решетка =========
+x = np.linspace(-0.15, 0.15, 201)
+y = np.linspace(-0.15, 0.15, 201)
+X, Y = np.meshgrid(x, y)
+
+# ========= Параметри на електродите (точков модел) =========
+Rpair   = 0.060    # m – радиус до всеки електрод
+V_plus  = 1.0      # относителна амплитуда на + (източник)
+V_minus = 1.0      # относителна амплитуда на − (сток)
+z_elec  = 0.0      # m – височина на електродите
+soft_z  = 0.005    # m – избягва сингулярности
+
+# Въртене за „вортекс“ (може и False за статични електроди)
+rotate_electrodes = True
+f_rot_start = 0.5   # Hz
+f_rot_end   = 20.0  # Hz
+duration_s  = 8.0   # s (анимация)
+fps         = 30
+
+def phi_of_t(t, f0=f_rot_start, f1=f_rot_end, T=duration_s):
+    if not rotate_electrodes:
+        return 0.0
+    return 2*np.pi*( f0*t + 0.5*(f1 - f0)*(t**2)/T )
+
+# ========= (по избор) индуктивен принос – изключен по подразбиране =========
+use_inductive = False
+r_loop  = 0.030
+I_ind   = 10.0
+gamma_ind = 1.0
+polarity_ind = -1.0
+
+def loop_Aphi_offset(r_loop, I, x, y, z_obs, x0=0.0, y0=0.0, z0=0.0):
+    Xl = x - x0; Yl = y - y0
+    rho = np.hypot(Xl, Yl); zrel = z_obs - z0
+    rho_safe = np.maximum(rho, 1e-12)
+    m = 4*r_loop*rho_safe/((r_loop+rho_safe)**2 + zrel**2)
+    m = np.clip(m, 1e-16, 1-1e-12)
+    K = ellipk(m); E = ellipe(m); k = np.sqrt(m)
+    return mu0*I/np.pi * (1.0/k)*((1 - m/2.0)*K - E)
+
+# ========= Капацитивна двойка: E-вектор и потенциал V (със знак) =========
+def capacitive_pair_fields(phi, Rpair, Vp, Vm, z_obs=z_depth, z_src=z_elec, soft=soft_z):
+    # позиции на + и −
+    x1, y1 = Rpair*np.cos(phi), Rpair*np.sin(phi)     # +Vp
+    x2, y2 = -x1, -y1                                 # -Vm
+
+    # вектори към наблюдателната равнина
+    X1 = X - x1; Y1 = Y - y1; Z1 = z_obs - z_src + soft
+    X2 = X - x2; Y2 = Y - y2; Z2 = z_obs - z_src + soft
+
+    r1_sq = X1**2 + Y1**2 + Z1**2
+    r2_sq = X2**2 + Y2**2 + Z2**2
+    r1_32 = np.power(r1_sq, 1.5)
+    r2_32 = np.power(r2_sq, 1.5)
+
+    # E = sum(q * r_vec / r^3); q ~ V (скала)
+    Ex = (+Vp)*X1/r1_32  +  (-Vm)*X2/r2_32
+    Ey = (+Vp)*Y1/r1_32  +  (-Vm)*Y2/r2_32
+
+    # "Потенциал" (със знак, до умнож. по константа): V ~ Vp/|r1| - Vm/|r2|
+    V =  Vp/np.sqrt(r1_sq)  -  Vm/np.sqrt(r2_sq)
+
+    Eabs = np.hypot(Ex, Ey)
+    return Ex, Ey, Eabs, V, (x1, y1, x2, y2)
+
+def frame(phi):
+    Ex, Ey, E_cap, V, (x1,y1,x2,y2) = capacitive_pair_fields(phi, Rpair, V_plus, V_minus)
+
+    if use_inductive:
+        # наслагваме индуктивно (квадратурно) – по желание
+        A1 = loop_Aphi_offset(r_loop, +I_ind,                 X, Y, z_depth, x0=x1, y0=y1)
+        A2 = loop_Aphi_offset(r_loop,  polarity_ind*gamma_ind*I_ind, X, Y, z_depth, x0=x2, y0=y2)
+        E_ind = omega*np.abs(A1 + A2)
+        E_tot = np.sqrt(E_cap**2 + E_ind**2)
+    else:
+        E_tot = E_cap
+
+    P = sigma*(E_tot**2)
+    return Ex, Ey, E_tot, V, P, (x1,y1,x2,y2)
+
+# ========= Анимация =========
+n_frames = int(duration_s * fps)
+ts = np.linspace(0.0, duration_s, n_frames)
+
+Ex0, Ey0, E0, V0, P0, pos0 = frame(phi_of_t(0.0))
+E_max = np.max(E0) + 1e-12
+V_max = np.max(np.abs(V0)) + 1e-12
+P_max = np.max(P0) + 1e-12
+
+fig, axes = plt.subplots(1, 3, figsize=(14, 4.5))
+for ax in axes:
+    ax.set_aspect('equal'); ax.set_xticks([]); ax.set_yticks([])
+
+# |E|
+im_E = axes[0].imshow(E0/E_max, extent=[x.min(), x.max(), y.min(), y.max()],
+                      origin='lower', vmin=0, vmax=1, cmap='inferno')
+axes[0].set_title("|E| (моментно, норм.)")
+
+# знаков потенциал + стрелки
+im_V = axes[1].imshow(V0, extent=[x.min(), x.max(), y.min(), y.max()],
+                      origin='lower', vmin=-V_max, vmax=+V_max, cmap='seismic')
+axes[1].set_title("Потенциал V (със знак) + E-вектори")
+
+# downsample за quiver (по-леко за анимация)
+step = 8
+q = axes[1].quiver(X[::step,::step], Y[::step,::step],
+                   Ex0[::step,::step], Ey0[::step,::step],
+                   scale=300, width=0.003, color='k', alpha=0.7)
+
+# ⟨P⟩
+P_avg = np.zeros_like(P0)
+im_P = axes[2].imshow(P0/P_max, extent=[x.min(), x.max(), y.min(), y.max()],
+                      origin='lower', vmin=0, vmax=1, cmap='plasma')
+axes[2].set_title("⟨P⟩ (времево осреднена, норм.)")
+
+# маркери за електродите
+(x1,y1,x2,y2) = pos0
+plus_dot  = axes[1].plot([x1],[y1],'wo',ms=6)[0]
+minus_dot = axes[1].plot([x2],[y2],'ko',ms=6)[0]
+plus_txt  = axes[1].text(x1, y1, "+", color='w', ha='center', va='center', fontsize=12, weight='bold')
+minus_txt = axes[1].text(x2, y2, "−", color='k', ha='center', va='center', fontsize=14, weight='bold')
+
+hdr = fig.text(0.5, 0.95, "", ha='center')
+
+def update(k):
+    global P_avg
+    t = ts[k]
+    phi = phi_of_t(t)
+
+    Ex, Ey, E, V, P, (x1,y1,x2,y2) = frame(phi)
+
+    # |E|
+    im_E.set_data(E/E_max)
+
+    # V и стрелки
+    im_V.set_data(V)
+    q.set_UVC(Ex[::step,::step], Ey[::step,::step])
+    plus_dot.set_data([x1],[y1]); minus_dot.set_data([x2],[y2])
+    plus_txt.set_position((x1,y1)); minus_txt.set_position((x2,y2))
+
+    # ⟨P⟩
+    P_avg = (P_avg*k + P)/(k+1)
+    im_P.set_data(P_avg/P_max)
+
+    f_inst = f_rot_start + (f_rot_end - f_rot_start)*t/duration_s if rotate_electrodes else 0.0
+    hdr.set_text(f"|E|, V (знаков) и ⟨P⟩  |  t={t:5.2f}s, f_rot={f_inst:5.2f} Hz   (+Vp={V_plus:.2f}, −Vm={V_minus:.2f})")
+    return im_E, im_V, q, im_P, plus_dot, minus_dot, plus_txt, minus_txt, hdr
+
+ani = FuncAnimation(fig, update, frames=n_frames, interval=1000/fps, blit=False)
+plt.tight_layout(); plt.show()
+
+# --- по желание: запис на GIF ---
+# from matplotlib.animation import PillowWriter
+# PillowWriter(fps=fps).save("two_electrodes_source_sink.gif", ani)
